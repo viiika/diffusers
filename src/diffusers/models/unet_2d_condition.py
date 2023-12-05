@@ -798,7 +798,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         self,
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor, # (batch, sequence_length, feature_dim) or a dict of tensors
         class_labels: Optional[torch.Tensor] = None,
         timestep_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -951,7 +951,12 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 emb = emb + class_emb
 
         if self.config.addition_embed_type == "text":
-            aug_emb = self.add_embedding(encoder_hidden_states)
+            if isinstance(encoder_hidden_states, dict):
+                for k, v in encoder_hidden_states.items():
+                    if k == "global":
+                        aug_emb = self.add_embedding(v)
+            else:      
+                aug_emb = self.add_embedding(encoder_hidden_states)
         elif self.config.addition_embed_type == "text_image":
             # Kandinsky 2.1 - style
             if "image_embeds" not in added_cond_kwargs:
@@ -1004,7 +1009,11 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             emb = self.time_embed_act(emb)
 
         if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_proj":
-            encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
+            if isinstance(encoder_hidden_states, dict):
+                for k, v in encoder_hidden_states.items():
+                    encoder_hidden_states[k] = self.encoder_hid_proj(v)
+            else:
+                encoder_hidden_states = self.encoder_hid_proj(encoder_hidden_states)
         elif self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "text_image_proj":
             # Kadinsky 2.1 - style
             if "image_embeds" not in added_cond_kwargs:
@@ -1056,6 +1065,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             is_adapter = True
 
         down_block_res_samples = (sample,)
+        layer_number = 0
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 # For t2i-adapter CrossAttnDownBlock2D
@@ -1063,15 +1073,30 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
                     additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
 
-                sample, res_samples = downsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    encoder_attention_mask=encoder_attention_mask,
-                    **additional_residuals,
-                )
+                if isinstance(encoder_hidden_states, dict):
+                    sample, res_samples = downsample_block(
+                        hidden_states=sample,
+                        temb=emb,
+                        encoder_hidden_states=[encoder_hidden_states['down_block_'+str(layer_number)+'_0'], encoder_hidden_states['down_block_'+str(layer_number)+'_1']],
+                        attention_mask=attention_mask,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        encoder_attention_mask=encoder_attention_mask,
+                        **additional_residuals,
+                    )
+                    layer_number += 1
+                    
+                else:
+                    sample, res_samples = downsample_block(
+                        hidden_states=sample,
+                        temb=emb,
+                        encoder_hidden_states=encoder_hidden_states, 
+                        # Will repeat 3 times, each time with 2 attention, will be named as `down_block_0_0`, `down_block_0_1`, `down_block_1_0`, `down_block_1_1`, `down_block_2_0`, `down_block_2_1`
+                        attention_mask=attention_mask,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        encoder_attention_mask=encoder_attention_mask,
+                        **additional_residuals,
+                    )
+                # print("Downsample block with cross attention")
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb, scale=lora_scale)
                 if is_adapter and len(down_intrablock_additional_residuals) > 0:
@@ -1093,14 +1118,26 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # 4. mid
         if self.mid_block is not None:
             if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
-                sample = self.mid_block(
-                    sample,
-                    emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    encoder_attention_mask=encoder_attention_mask,
-                )
+                if isinstance(encoder_hidden_states, dict):
+                    sample = self.mid_block(
+                        sample,
+                        emb,
+                        encoder_hidden_states=encoder_hidden_states['mid_block_0'],
+                        attention_mask=attention_mask,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+
+                else:
+                    sample = self.mid_block(
+                        sample,
+                        emb,
+                        encoder_hidden_states=encoder_hidden_states, # Will repeat 1 times
+                        attention_mask=attention_mask,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+                # print("Mid block with cross attention")
             else:
                 sample = self.mid_block(sample, emb)
 
@@ -1128,16 +1165,30 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 upsample_size = down_block_res_samples[-1].shape[2:]
 
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
-                sample = upsample_block(
-                    hidden_states=sample,
-                    temb=emb,
-                    res_hidden_states_tuple=res_samples,
-                    encoder_hidden_states=encoder_hidden_states,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    upsample_size=upsample_size,
-                    attention_mask=attention_mask,
-                    encoder_attention_mask=encoder_attention_mask,
-                )
+                if isinstance(encoder_hidden_states, dict):
+                    sample = upsample_block(
+                        hidden_states=sample,
+                        temb=emb,
+                        res_hidden_states_tuple=res_samples,
+                        encoder_hidden_states=[encoder_hidden_states['up_block_'+str(layer_number-3)+'_0'], encoder_hidden_states['up_block_'+str(layer_number-3)+'_1'], encoder_hidden_states['up_block_'+str(layer_number-3)+'_2']],
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        upsample_size=upsample_size,
+                        attention_mask=attention_mask,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+                    layer_number += 1
+                else:
+                    sample = upsample_block(
+                        hidden_states=sample,
+                        temb=emb,
+                        res_hidden_states_tuple=res_samples,
+                        encoder_hidden_states=encoder_hidden_states, # Will repeat 3 times
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        upsample_size=upsample_size,
+                        attention_mask=attention_mask,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+                # print("Upsample block with cross attention")
             else:
                 sample = upsample_block(
                     hidden_states=sample,

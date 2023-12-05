@@ -273,7 +273,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `List[str]` or `dict` or `List[dict]`, *optional*):
                 prompt to be encoded
             device: (`torch.device`):
                 torch device
@@ -281,7 +281,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 number of images that should be generated per prompt
             do_classifier_free_guidance (`bool`):
                 whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `List[str]` or `dict` or `List[dict]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
@@ -309,7 +309,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             else:
                 scale_lora_layers(self.text_encoder, lora_scale)
 
-        if prompt is not None and isinstance(prompt, str):
+        if prompt is not None and isinstance(prompt, str) or isinstance(prompt, dict):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
@@ -319,70 +319,213 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         if prompt_embeds is None:
             # textual inversion: procecss multi-vector tokens if necessary
             if isinstance(self, TextualInversionLoaderMixin):
-                prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+                if isinstance(prompt, dict):# and all(isinstance(item, dict) for item in prompt):
+                    for key, value in prompt.items():
+                        prompt[key] = self.maybe_convert_prompt(value, self.tokenizer)
+                else:
+                    prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
 
-            text_inputs = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+            if isinstance(prompt, dict):# and all(isinstance(item, dict) for item in prompt):
+                
+                if isinstance(prompt, dict):
+                    prompt_embeds_dict = {}
+                    for key, value in prompt.items():
+                        text_inputs = self.tokenizer(
+                            value,
+                            padding="max_length",
+                            max_length=self.tokenizer.model_max_length,
+                            truncation=True,
+                            return_tensors="pt",
+                        )
+                        text_input_ids = text_inputs.input_ids
+                        untruncated_ids = self.tokenizer(value, padding="longest", return_tensors="pt").input_ids
 
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-                text_input_ids, untruncated_ids
-            ):
-                removed_text = self.tokenizer.batch_decode(
-                    untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
-                )
-                logger.warning(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {self.tokenizer.model_max_length} tokens: {removed_text}"
-                )
+                        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                            text_input_ids, untruncated_ids
+                        ):
+                            removed_text = self.tokenizer.batch_decode(
+                                untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+                            )
+                            logger.warning(
+                                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+                            )
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = text_inputs.attention_mask.to(device)
+                        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                            attention_mask = text_inputs.attention_mask.to(device)
+                        else:
+                            attention_mask = None
+
+                        if clip_skip is None:
+                            prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
+                            prompt_embeds = prompt_embeds[0]
+                        else:
+                            prompt_embeds = self.text_encoder(
+                                text_input_ids.to(device), attention_mask=attention_mask, output_hidden_states=True
+                            )
+                            # Access the `hidden_states` first, that contains a tuple of
+                            # all the hidden states from the encoder layers. Then index into
+                            # the tuple to access the hidden states from the desired layer.
+                            prompt_embeds = prompt_embeds[-1][-(clip_skip + 1)]
+                            # We also need to apply the final LayerNorm here to not mess with the
+                            # representations. The `last_hidden_states` that we typically use for
+                            # obtaining the final prompt representations passes through the LayerNorm
+                            # layer.
+                            prompt_embeds = self.text_encoder.text_model.final_layer_norm(prompt_embeds)
+                        prompt_embeds_dict[key] = prompt_embeds
+                    prompt_embeds = prompt_embeds_dict
+                else:# if isinstance(prompt, list(dict)):
+                    pass # TODO: implement
             else:
-                attention_mask = None
-
-            if clip_skip is None:
-                prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
-                prompt_embeds = prompt_embeds[0]
-            else:
-                prompt_embeds = self.text_encoder(
-                    text_input_ids.to(device), attention_mask=attention_mask, output_hidden_states=True
+                text_inputs = self.tokenizer(
+                    prompt,
+                    padding="max_length",
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
                 )
-                # Access the `hidden_states` first, that contains a tuple of
-                # all the hidden states from the encoder layers. Then index into
-                # the tuple to access the hidden states from the desired layer.
-                prompt_embeds = prompt_embeds[-1][-(clip_skip + 1)]
-                # We also need to apply the final LayerNorm here to not mess with the
-                # representations. The `last_hidden_states` that we typically use for
-                # obtaining the final prompt representations passes through the LayerNorm
-                # layer.
-                prompt_embeds = self.text_encoder.text_model.final_layer_norm(prompt_embeds)
+                text_input_ids = text_inputs.input_ids
+                untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
-        if self.text_encoder is not None:
-            prompt_embeds_dtype = self.text_encoder.dtype
-        elif self.unet is not None:
-            prompt_embeds_dtype = self.unet.dtype
+                if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                    text_input_ids, untruncated_ids
+                ):
+                    removed_text = self.tokenizer.batch_decode(
+                        untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+                    )
+                    logger.warning(
+                        "The following part of your input was truncated because CLIP can only handle sequences up to"
+                        f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+                    )
+
+                if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                    attention_mask = text_inputs.attention_mask.to(device)
+                else:
+                    attention_mask = None
+
+
+                clip_skip = -1
+                if clip_skip is None:
+                    prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=attention_mask)
+                    prompt_embeds = prompt_embeds[0]
+                elif clip_skip == -1:
+                    prompt_embeds = self.text_encoder(
+                        text_input_ids.to(device), attention_mask=attention_mask, output_hidden_states=True
+                    )
+                    ### my comments: prompt_embeds[-1] is a tuple of 13 elements, each element is a tensor of shape (batch_size, seq_len, hidden_size), 13 <class 'tuple'> 
+                    ### my comments: prompt_embeds[-1][0] is a tensor of shape (batch_size, seq_len, hidden_size), torch.Size([1, 77, 512])
+
+                    prompt_embeds = prompt_embeds[-1] #[-(clip_skip + 1)]
+                    # transform the tuple into a tensor as [13, 77, 512]
+                    prompt_embeds = torch.stack(prompt_embeds, dim=0) # [13, 1, 77, 512]
+                    prompt_embeds = torch.squeeze(prompt_embeds, dim=1) # [13, 77, 512]
+
+                    # print("prompt_embeds", prompt_embeds.shape)
+
+
+                    # We also need to apply the final LayerNorm here to not mess with the
+                    # representations. The `last_hidden_states` that we typically use for
+                    # obtaining the final prompt representations passes through the LayerNorm
+                    # layer.
+                    prompt_embeds = self.text_encoder.text_model.final_layer_norm(prompt_embeds)
+
+
+
+                    ######### Input: [13, 77, 512] #########
+                    ### Model
+                    ######### Output: [16, 77, 512] #########
+                    #Output should be a dict of 16 elements, each element is a tensor of shape (batch_size, seq_len, hidden_size)
+                    
+                    # # prompt_embeds = prompt_embeds_dict
+                    # prompt_embeds_dict = {}
+                    # prompt_embeds_dict["down_block_0_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["down_block_0_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["down_block_1_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["down_block_1_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["down_block_2_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["down_block_2_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["mid_block_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_0_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_0_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_0_2"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_1_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_1_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_1_2"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_2_0"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_2_1"] = prompt_embeds[-1, :, : ]
+                    # prompt_embeds_dict["up_block_2_2"] = prompt_embeds[-1, :, : ]
+
+                    # prompt_embeds = prompt_embeds_dict
+
+
+
+
+
+
+
+
+                else:
+                    prompt_embeds = self.text_encoder(
+                        text_input_ids.to(device), attention_mask=attention_mask, output_hidden_states=True
+                    )
+                    ### my comments: prompt_embeds[-1] is a tuple of 13 elements, each element is a tensor of shape (batch_size, seq_len, hidden_size), 13 <class 'tuple'> 
+                    ### my comments: prompt_embeds[-1][0] is a tensor of shape (batch_size, seq_len, hidden_size), torch.Size([1, 77, 512])
+                    # Access the `hidden_states` first, that contains a tuple of
+                    # all the hidden states from the encoder layers. Then index into
+                    # the tuple to access the hidden states from the desired layer.
+                    prompt_embeds = prompt_embeds[-1][-(clip_skip + 1)]
+                    # We also need to apply the final LayerNorm here to not mess with the
+                    # representations. The `last_hidden_states` that we typically use for
+                    # obtaining the final prompt representations passes through the LayerNorm
+                    # layer.
+                    prompt_embeds = self.text_encoder.text_model.final_layer_norm(prompt_embeds)
+
+        if isinstance(prompt, dict):# and all(isinstance(item, dict) for item in prompt):
+            
+            if isinstance(prompt, dict):
+                if self.text_encoder is not None:
+                    prompt_embeds_dtype = self.text_encoder.dtype
+                elif self.unet is not None:
+                    prompt_embeds_dtype = self.unet.dtype
+                else:
+                    logger.warning("ERROR: prompt_embeds_dtype not defined")
+                    #prompt_embeds_dtype = prompt_embeds.dtype
+                for key, value in prompt_embeds.items():
+                    prompt_embeds[key] = value.to(dtype=prompt_embeds_dtype, device=device)
+
+                    bs_embed, seq_len, _ = prompt_embeds[key].shape
+                    # duplicate text embeddings for each generation per prompt, using mps friendly method
+                    prompt_embeds[key] = prompt_embeds[key].repeat(1, num_images_per_prompt, 1)
+                    prompt_embeds[key] = prompt_embeds[key].view(bs_embed * num_images_per_prompt, seq_len, -1)
+            else: # if isinstance(prompt, list(dict)):
+                pass # TODO: implement
         else:
-            prompt_embeds_dtype = prompt_embeds.dtype
 
-        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+            if self.text_encoder is not None:
+                prompt_embeds_dtype = self.text_encoder.dtype
+            elif self.unet is not None:
+                prompt_embeds_dtype = self.unet.dtype
+            else:
+                prompt_embeds_dtype = prompt_embeds.dtype
 
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+            prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            # duplicate text embeddings for each generation per prompt, using mps friendly method
+            prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+            prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             uncond_tokens: List[str]
             if negative_prompt is None:
-                uncond_tokens = [""] * batch_size
+                if isinstance(prompt, dict):# and all(isinstance(item, dict) for item in prompt):
+                    uncond_tokens = dict()
+                    for key, value in prompt_embeds.items():
+                        batch_size = value.shape[0]
+                        uncond_tokens[key] = [""] * batch_size
+                else:
+                    uncond_tokens = [""] * batch_size
             elif prompt is not None and type(prompt) is not type(negative_prompt):
                 raise TypeError(
                     f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
@@ -401,41 +544,84 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
             # textual inversion: procecss multi-vector tokens if necessary
             if isinstance(self, TextualInversionLoaderMixin):
-                uncond_tokens = self.maybe_convert_prompt(uncond_tokens, self.tokenizer)
+                if isinstance(uncond_tokens, dict):# and all(isinstance(item, dict) for item in uncond_tokens):
+                    for key, value in uncond_tokens.items():
+                        uncond_tokens[key] = self.maybe_convert_prompt(value, self.tokenizer)
+                else:
+                    uncond_tokens = self.maybe_convert_prompt(uncond_tokens, self.tokenizer)
 
-            max_length = prompt_embeds.shape[1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
+            if isinstance(uncond_tokens, dict):# and all(isinstance(item, dict) for item in uncond_tokens):
+                negative_prompt_embeds_dict = {}
+                for key, value in uncond_tokens.items():
+                    if isinstance(uncond_tokens, dict):
+                        max_length = prompt_embeds_dict[key].shape[1]
+                        uncond_input = self.tokenizer(
+                            value,
+                            padding="max_length",
+                            max_length=max_length,
+                            truncation=True,
+                            return_tensors="pt",
+                        )
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
+                        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                            attention_mask = uncond_input.attention_mask.to(device)
+                        else:
+                            attention_mask = None
+
+                        negative_prompt_embeds = self.text_encoder(
+                            uncond_input.input_ids.to(device),
+                            attention_mask=attention_mask,
+                        )
+                        negative_prompt_embeds = negative_prompt_embeds[0]
+                        negative_prompt_embeds_dict[key] = negative_prompt_embeds
+                    else: #if isinstance(uncond_tokens, list(dict)):
+                        logger.warning("ERROR: uncond_tokens not implemented for list(dict)")
+                negative_prompt_embeds = negative_prompt_embeds_dict
             else:
-                attention_mask = None
+                max_length = prompt_embeds.shape[1]
+                uncond_input = self.tokenizer(
+                    uncond_tokens,
+                    padding="max_length",
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
 
-            negative_prompt_embeds = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
-            negative_prompt_embeds = negative_prompt_embeds[0]
+                if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+                    attention_mask = uncond_input.attention_mask.to(device)
+                else:
+                    attention_mask = None
 
-        if do_classifier_free_guidance:
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = negative_prompt_embeds.shape[1]
+                negative_prompt_embeds = self.text_encoder(
+                    uncond_input.input_ids.to(device),
+                    attention_mask=attention_mask,
+                )
+                negative_prompt_embeds = negative_prompt_embeds[0]
 
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+        if do_classifier_free_guidance: 
+            if isinstance(negative_prompt_embeds, dict):# and all(isinstance(item, dict) for item in negative_prompt):
+                for key, value in negative_prompt_embeds.items():
+                    seq_len = negative_prompt_embeds[key].shape[1]
 
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+                    negative_prompt_embeds[key] = negative_prompt_embeds[key].to(dtype=prompt_embeds_dtype, device=device)
+
+                    negative_prompt_embeds[key] = negative_prompt_embeds[key].repeat(1, num_images_per_prompt, 1)
+                    negative_prompt_embeds[key] = negative_prompt_embeds[key].view(batch_size * num_images_per_prompt, seq_len, -1)
+            else:
+                # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+                seq_len = negative_prompt_embeds.shape[1]
+
+                negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+
+                negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+                negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
         if isinstance(self, LoraLoaderMixin) and USE_PEFT_BACKEND:
             # Retrieve the original scale by scaling back the LoRA layers
             unscale_lora_layers(self.text_encoder, lora_scale)
 
+        # print("prompt_embeds", prompt_embeds.shape) # [13, 77, 768]
+        # print("negative_prompt_embeds", negative_prompt_embeds.shape) # [1, 77, 768]
         return prompt_embeds, negative_prompt_embeds
 
     def run_safety_checker(self, image, device, dtype):
@@ -510,8 +696,8 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list) and not isinstance(prompt, dict)):
+            raise ValueError(f"`prompt` has to be of type `str` or `list` or `dict` but is {type(prompt)}")
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -574,12 +760,12 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: Union[str, List[str], dict, List[dict]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
+        negative_prompt: Optional[Union[str, List[str], dict, List[dict]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -673,7 +859,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         )
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
+        if prompt is not None and isinstance(prompt, str) or isinstance(prompt, dict):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
@@ -700,11 +886,60 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             lora_scale=lora_scale,
             clip_skip=clip_skip,
         )
+
+
+        # 3.5 Here we will add our latent control framework
+        # Specifically, input will be [13,77,768] and output will be [16,77,768]
+        # which means we will transform all the 13 layers embeddings from CLIP Text Encoder to 
+        #                 16 embeddings for our UNet
+        # Finally, we will transform the 16 embeddings to a dict.
+        
+        prompt_embeds_dict = {}
+        prompt_embeds_dict["down_block_0_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["down_block_0_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["down_block_1_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["down_block_1_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["down_block_2_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["down_block_2_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["mid_block_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_0_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_0_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_0_2"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_1_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_1_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_1_2"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_2_0"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_2_1"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+        prompt_embeds_dict["up_block_2_2"] = prompt_embeds[-1, :, : ].reshape(1, 77, 768)
+
+        prompt_embeds = prompt_embeds_dict
+
+
+
+
+
+
+
+
+
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
         if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+            # print("do_classifier_free_guidance")
+            # TDOO NOW
+            if isinstance(prompt_embeds, dict) and isinstance(negative_prompt_embeds, dict):
+                prompt_embeds_dict = {}
+                for key, value in prompt_embeds.items():
+                    prompt_embeds_dict[key] = torch.cat([negative_prompt_embeds[key], value])
+                prompt_embeds = prompt_embeds_dict
+            elif isinstance(prompt_embeds, dict) and not isinstance(negative_prompt_embeds, dict):
+                prompt_embeds_dict = {}
+                for key, value in prompt_embeds.items():
+                    prompt_embeds_dict[key] = torch.cat([negative_prompt_embeds, value])
+                prompt_embeds = prompt_embeds_dict
+            else:
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -712,16 +947,30 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        if isinstance(prompt_embeds, dict):
+            for key, value in prompt_embeds.items():
+                prompt_embeds_dtype = value.dtype
+                break
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds_dtype,
+                device,
+                generator,
+            )
+        else:
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -738,7 +987,7 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=prompt_embeds, # prompt_embeds is a dict
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
                 )[0]
@@ -764,7 +1013,9 @@ class StableDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+
+            has_nsfw_concept = None
         else:
             image = latents
             has_nsfw_concept = None
